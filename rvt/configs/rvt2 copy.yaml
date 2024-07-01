@@ -1,5 +1,5 @@
 exp_id: rvt2
-tasks: insert_onto_square_peg
+tasks: all
 bs: 24
 num_workers: 3
 epochs: 15

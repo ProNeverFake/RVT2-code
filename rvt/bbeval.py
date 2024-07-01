@@ -415,6 +415,224 @@ def eval(
 
     return scores
 
+# * CORE
+@torch.no_grad()
+def eval(
+    agent,
+    tasks,
+    eval_datafolder,
+    start_episode=0,
+    eval_episodes=25,
+    episode_length=25,
+    replay_ground_truth=False,
+    device=0,
+    headless=True,
+    logging=False,
+    log_dir=None,
+    verbose=True,
+    save_video=False,
+):
+    agent.eval()
+    if isinstance(agent, rvt_agent.RVTAgent):
+        agent.load_clip()
+
+    camera_resolution = [IMAGE_SIZE, IMAGE_SIZE]
+    obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
+
+    gripper_mode = Discrete()
+    arm_action_mode = EndEffectorPoseViaPlanning()
+    action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
+
+    task_files = [
+        t.replace(".py", "")
+        for t in os.listdir(rlbench_task.TASKS_PATH)
+        if t != "__init__.py" and t.endswith(".py")
+    ]
+
+    task_classes = []
+    if tasks[0] == "all":
+        tasks = RLBENCH_TASKS
+        if verbose:
+            print(f"evaluate on {len(tasks)} tasks: ", tasks)
+
+    for task in tasks:
+        if task not in task_files:
+            raise ValueError("Task %s not recognised!." % task)
+        task_classes.append(task_file_to_task_class(task))
+
+    eval_env = CustomMultiTaskRLBenchEnv(
+        task_classes=task_classes,
+        observation_config=obs_config,
+        action_mode=action_mode,
+        dataset_root=eval_datafolder,
+        episode_length=episode_length,
+        headless=headless,
+        swap_task_every=eval_episodes,
+        include_lang_goal_in_obs=True,
+        time_in_state=True,
+        record_every_n=1 if save_video else -1,
+    )
+
+    eval_env.eval = True
+
+    device = f"cuda:{device}"
+
+    if logging:
+        assert log_dir is not None
+
+        # create metric saving writer
+        csv_file = "eval_results.csv"
+        if not os.path.exists(os.path.join(log_dir, csv_file)):
+            with open(os.path.join(log_dir, csv_file), "w") as csv_fp:
+                fieldnames = ["task", "success rate", "length", "total_transitions"]
+                csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
+                csv_writer.writeheader()
+
+    # evaluate agent
+    rollout_generator = RolloutGenerator(device)
+    stats_accumulator = SimpleAccumulator(eval_video_fps=30)
+
+    eval_env.launch()
+
+    current_task_id = -1
+
+    num_tasks = len(tasks)
+    step_signal = Value("i", -1)
+
+    scores = []
+    for task_id in range(num_tasks):
+        task_rewards = []
+        for ep in range(start_episode, start_episode + eval_episodes):
+            episode_rollout = []
+            generator = rollout_generator.generator(
+                step_signal=step_signal,
+                env=eval_env,
+                agent=agent,
+                episode_length=episode_length,
+                timesteps=1,
+                eval=True,
+                eval_demo_seed=ep,
+                record_enabled=False,
+                replay_ground_truth=replay_ground_truth,
+            )
+            try:
+                for replay_transition in generator:
+                    episode_rollout.append(replay_transition)
+            except StopIteration as e:
+                continue
+            except Exception as e:
+                eval_env.shutdown()
+                raise e
+
+            for transition in episode_rollout:
+                stats_accumulator.step(transition, True)
+                current_task_id = transition.info["active_task_id"]
+                assert current_task_id == task_id
+
+            task_name = tasks[task_id]
+            reward = episode_rollout[-1].reward
+            task_rewards.append(reward)
+            lang_goal = eval_env._lang_goal
+            if verbose:
+                print(
+                    f"Evaluating {task_name} | Episode {ep} | Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
+                )
+
+        # report summaries
+        summaries = []
+        summaries.extend(stats_accumulator.pop())
+        task_name = tasks[task_id]
+        if logging:
+            # writer csv first
+            with open(os.path.join(log_dir, csv_file), "a") as csv_fp:
+                fieldnames = ["task", "success rate", "length", "total_transitions"]
+                csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
+                csv_results = {"task": task_name}
+                for s in summaries:
+                    if s.name == "eval_envs/return":
+                        csv_results["success rate"] = s.value
+                    elif s.name == "eval_envs/length":
+                        csv_results["length"] = s.value
+                    elif s.name == "eval_envs/total_transitions":
+                        csv_results["total_transitions"] = s.value
+                    if "eval" in s.name:
+                        s.name = "%s/%s" % (s.name, task_name)
+                csv_writer.writerow(csv_results)
+        else:
+            for s in summaries:
+                if "eval" in s.name:
+                    s.name = "%s/%s" % (s.name, task_name)
+
+        if len(summaries) > 0:
+            task_score = [
+                s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name
+            ][0]
+        else:
+            task_score = "unknown"
+
+        print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
+
+        scores.append(task_score)
+
+        if save_video:
+            video_image_folder = "./tmp"
+            record_fps = 25
+            record_folder = os.path.join(log_dir, "videos")
+            os.makedirs(record_folder, exist_ok=True)
+            video_success_cnt = 0
+            video_fail_cnt = 0
+            video_cnt = 0
+            for summary in summaries:
+                if isinstance(summary, VideoSummary):
+                    video = deepcopy(summary.value)
+                    video = np.transpose(video, (0, 2, 3, 1))
+                    video = video[:, :, :, ::-1]
+                    if task_rewards[video_cnt] > 99:
+                        video_path = os.path.join(
+                            record_folder,
+                            f"{task_name}_success_{video_success_cnt}.mp4",
+                        )
+                        video_success_cnt += 1
+                    else:
+                        video_path = os.path.join(
+                            record_folder, f"{task_name}_fail_{video_fail_cnt}.mp4"
+                        )
+                        video_fail_cnt += 1
+                    video_cnt += 1
+                    os.makedirs(video_image_folder, exist_ok=True)
+                    for idx in range(len(video) - 10):
+                        cv2.imwrite(
+                            os.path.join(video_image_folder, f"{idx}.png"), video[idx]
+                        )
+                    images_path = os.path.join(video_image_folder, r"%d.png")
+                    os.system(
+                        "ffmpeg -i {} -vf palettegen palette.png -hide_banner -loglevel error".format(
+                            images_path
+                        )
+                    )
+                    os.system(
+                        "ffmpeg -framerate {} -i {} -i palette.png -lavfi paletteuse {} -hide_banner -loglevel error".format(
+                            record_fps, images_path, video_path
+                        )
+                    )
+                    os.remove("palette.png")
+                    shutil.rmtree(video_image_folder)
+
+    eval_env.shutdown()
+
+    if logging:
+        csv_fp.close()
+
+    # set agent to back train mode
+    agent.train()
+
+    # unloading clip to save memory
+    if isinstance(agent, rvt_agent.RVTAgent):
+        agent.unload_clip()
+        agent._network.free_mem()
+
+    return scores
+
 
 def get_model_index(filename):
     """
@@ -530,13 +748,13 @@ def _eval(args):
             save_video=args.save_video,
         )
         print(f"model {model_path}, scores {scores}")
-        task_scores = {}
-        for i in range(len(tasks_to_eval)):
-            task_scores[tasks_to_eval[i]] = scores[i]
+        # task_scores = {}
+        # for i in range(len(tasks_to_eval)):
+        #     task_scores[tasks_to_eval[i]] = scores[i]
 
-        print("save ", task_scores)
-        tb.update("eval", model_idx, task_scores)
-        tb.writer.flush()
+        # print("save ", task_scores)
+        # tb.update("eval", model_idx, task_scores)
+        # tb.writer.flush()
 
     tb.close()
 

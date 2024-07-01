@@ -415,9 +415,9 @@ def eval(
 
     return scores
 
-# * CORE
+# * BBCORE
 @torch.no_grad()
-def eval(
+def BBeval(
     agent,
     tasks,
     eval_datafolder,
@@ -432,17 +432,23 @@ def eval(
     verbose=True,
     save_video=False,
 ):
+    '''
+    evaluate all the tasks in this method.
+    '''
     agent.eval()
     if isinstance(agent, rvt_agent.RVTAgent):
         agent.load_clip()
 
+    # observation config
     camera_resolution = [IMAGE_SIZE, IMAGE_SIZE]
     obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
 
+    # action config
     gripper_mode = Discrete()
     arm_action_mode = EndEffectorPoseViaPlanning()
     action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
 
+    # load tasks
     task_files = [
         t.replace(".py", "")
         for t in os.listdir(rlbench_task.TASKS_PATH)
@@ -460,6 +466,7 @@ def eval(
             raise ValueError("Task %s not recognised!." % task)
         task_classes.append(task_file_to_task_class(task))
 
+    # create environment
     eval_env = CustomMultiTaskRLBenchEnv(
         task_classes=task_classes,
         observation_config=obs_config,
